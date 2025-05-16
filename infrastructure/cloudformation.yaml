@@ -1,0 +1,199 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS RAG Application Infrastructure with Lambda, API Gateway, Bedrock, and OpenSearch'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: dev
+    AllowedValues: [dev, staging, prod]
+    Description: Environment type
+
+  LambdaTimeout:
+    Type: Number
+    Default: 30
+    Description: Lambda function timeout in seconds
+  
+  LambdaMemorySize:
+    Type: Number
+    Default: 1024
+    Description: Lambda function memory size in MB
+
+  EmbeddingModelId:
+    Type: String
+    Default: amazon.titan-embed-text-v1
+    Description: Bedrock embedding model ID
+  
+  GenerationModelId:
+    Type: String
+    Default: anthropic.claude-3-sonnet-20240229-v1:0
+    Description: Bedrock generative model ID
+  
+  OpenSearchDomainName:
+    Type: String
+    Default: rag-opensearch
+    Description: OpenSearch domain name
+  
+  OpenSearchInstanceType:
+    Type: String
+    Default: t3.small.search
+    Description: OpenSearch instance type
+  
+  OpenSearchInstanceCount:
+    Type: Number
+    Default: 1
+    Description: Number of OpenSearch instances
+
+Resources:
+  # IAM Role for Lambda function
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                Resource: '*'
+        - PolicyName: OpenSearchAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - es:ESHttpGet
+                  - es:ESHttpPost
+                  - es:ESHttpPut
+                Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}/*'
+
+  # Lambda Function
+  RagLambdaFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub 'bedrock-rag-${Environment}'
+      Runtime: python3.10
+      Handler: lambda/app.lambda_handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: !Ref LambdaTimeout
+      MemorySize: !Ref LambdaMemorySize
+      Environment:
+        Variables:
+          EMBEDDING_MODEL_ID: !Ref EmbeddingModelId
+          GENERATION_MODEL_ID: !Ref GenerationModelId
+          OPENSEARCH_ENDPOINT: !GetAtt OpenSearchDomain.DomainEndpoint
+          OPENSEARCH_INDEX: 'rag-documents'
+          OPENSEARCH_USE_SSL: 'True'
+          OPENSEARCH_VERIFY_CERTS: 'True'
+          USE_AWS_AUTH: 'True'
+          MAX_SEARCH_RESULTS: '3'
+          AWS_REGION: !Ref 'AWS::Region'
+          LOG_LEVEL: 'INFO'
+      Code:
+        S3Bucket: !Ref DeploymentBucket
+        S3Key: !Ref DeploymentPackage
+
+  # Lambda Permission for API Gateway
+  LambdaApiGatewayPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref RagLambdaFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${RagApi}/*'
+
+  # API Gateway
+  RagApi:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub 'bedrock-rag-api-${Environment}'
+      Description: API Gateway for Bedrock RAG application
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+
+  # API Gateway Resource
+  RagResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref RagApi
+      ParentId: !GetAtt RagApi.RootResourceId
+      PathPart: 'rag'
+
+  # API Gateway Method
+  RagMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref RagApi
+      ResourceId: !Ref RagResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${RagLambdaFunction.Arn}/invocations'
+
+  # API Gateway Deployment
+  RagApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn: RagMethod
+    Properties:
+      RestApiId: !Ref RagApi
+      StageName: !Ref Environment
+
+  # OpenSearch Domain
+  OpenSearchDomain:
+    Type: AWS::OpenSearchService::Domain
+    Properties:
+      DomainName: !Ref OpenSearchDomainName
+      EngineVersion: 'OpenSearch_2.11'
+      ClusterConfig:
+        InstanceType: !Ref OpenSearchInstanceType
+        InstanceCount: !Ref OpenSearchInstanceCount
+        DedicatedMasterEnabled: false
+        ZoneAwarenessEnabled: false
+      EBSOptions:
+        EBSEnabled: true
+        VolumeType: gp3
+        VolumeSize: 10
+      AccessPolicies:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:role/${LambdaExecutionRole}'
+            Action: 'es:*'
+            Resource: !Sub 'arn:aws:es:${AWS::Region}:${AWS::AccountId}:domain/${OpenSearchDomainName}/*'
+      AdvancedOptions:
+        rest.action.multi.allow_explicit_index: 'true'
+
+  # S3 Bucket for Lambda deployment package
+  DeploymentBucket:
+    Type: AWS::S3::Bucket
+    Properties:
+      BucketName: !Sub 'bedrock-rag-deployment-${AWS::AccountId}-${AWS::Region}'
+      VersioningConfiguration:
+        Status: Enabled
+
+Outputs:
+  ApiEndpoint:
+    Description: API Gateway endpoint URL
+    Value: !Sub 'https://${RagApi}.execute-api.${AWS::Region}.amazonaws.com/${Environment}/rag'
+  
+  LambdaFunction:
+    Description: Lambda function name
+    Value: !Ref RagLambdaFunction
+  
+  OpenSearchDomainEndpoint:
+    Description: OpenSearch domain endpoint
+    Value: !GetAtt OpenSearchDomain.DomainEndpoint
