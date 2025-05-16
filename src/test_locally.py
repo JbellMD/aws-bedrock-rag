@@ -58,7 +58,7 @@ def main():
     
     # Import the Lambda handler
     try:
-        from lambda.app import lambda_handler
+        from lambda_function.app import lambda_handler
         
         # Create a mock event
         event = create_mock_event(args.prompt)
